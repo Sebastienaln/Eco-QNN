@@ -25,3 +25,4 @@ Pour un problème de classification du style n-sphère, on pourrait évaluer la 
 * Trouver un algorithme de QML utilisant n qubits qui nous servira de base
 * Trouver un article qui réussit à réduire le nombre de bits dans un circuit et étudier les stratégies employées
 * Avoir un meilleur visuel sur comment optimiser le nombre de shots et voir si cela peut s'insérer dans notre approche
+
