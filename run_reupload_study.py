@@ -12,6 +12,8 @@ import argparse
 from pathlib import Path
 import numpy as np
 import pandas as pd
+from multiprocessing import Pool
+from functools import partial
 from qiskit import QuantumCircuit, transpile
 from qiskit_aer import AerSimulator, StatevectorSimulator
 from qiskit_aer.noise import NoiseModel, depolarizing_error
@@ -141,46 +143,72 @@ def evaluate_reupload(X, y, theta, omega, num_layers, n_dim, backend, use_noise,
     return {"accuracy": accuracy, "y_pred": y_pred}
 
 
-def run_study(dimensions, layers_list, n_samples, test_size, maxiter, use_noise, noise_rate, shots, base_seed, repeats, output_path: Path):
-    """Run full study across dimensions/layers with multiple repeats (seeds)."""
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+def run_single_repeat(args_tuple):
+    """Run a single repeat (used by multiprocessing.Pool)."""
+    rep, seed, dimensions, layers_list, n_samples, test_size, maxiter, use_noise, noise_rate, shots = args_tuple
     records = []
+    backend = build_backend(use_noise, noise_rate)
     
-    for rep in range(repeats):
-        seed = base_seed + rep
-        print(f"\n{'='*60}\nRepeat {rep+1}/{repeats} (seed={seed})")
-        backend = build_backend(use_noise, noise_rate)
+    print(f"Starting repeat {rep+1} (seed={seed})")
+    
+    for d in dimensions:
+        X, y, _ = generate_nsphere_data(n_samples=n_samples, n_dim=d, radius=None, seed=seed)
+        rng = np.random.default_rng(seed)
+        indices = rng.permutation(len(X))
+        split_idx = int(len(X) * (1 - test_size))
+        train_idx, test_idx = indices[:split_idx], indices[split_idx:]
+        X_train, X_test = X[train_idx], X[test_idx]
+        y_train, y_test = y[train_idx], y[test_idx]
         
-        for d in dimensions:
-            print(f"\n--- Dimension {d} ---")
-            X, y, _ = generate_nsphere_data(n_samples=n_samples, n_dim=d, radius=None, seed=seed)
-            rng = np.random.default_rng(seed)
-            indices = rng.permutation(len(X))
-            split_idx = int(len(X) * (1 - test_size))
-            train_idx, test_idx = indices[:split_idx], indices[split_idx:]
-            X_train, X_test = X[train_idx], X[test_idx]
-            y_train, y_test = y[train_idx], y[test_idx]
-            
-            for L in layers_list:
-                res, t_opt, o_opt, a_opt = optimize_reupload_parameters(
-                    X_train, y_train, num_layers=L, n_dim=d, maxiter=maxiter, 
-                    seed=seed, backend=backend, use_noise=use_noise, shots=shots
-                )
-                metrics = evaluate_reupload(
-                    X_test, y_test, t_opt, o_opt, num_layers=L, n_dim=d, 
-                    backend=backend, use_noise=use_noise, shots=shots
-                )
-                records.append({
-                    "repeat": rep,
-                    "seed": seed,
-                    "dimension": d,
-                    "layers": L,
-                    "accuracy": metrics["accuracy"],
-                })
-                print(f"  Layers {L}: acc={metrics['accuracy']:.4f}")
+        for L in layers_list:
+            res, t_opt, o_opt, a_opt = optimize_reupload_parameters(
+                X_train, y_train, num_layers=L, n_dim=d, maxiter=maxiter, 
+                seed=seed, backend=backend, use_noise=use_noise, shots=shots
+            )
+            metrics = evaluate_reupload(
+                X_test, y_test, t_opt, o_opt, num_layers=L, n_dim=d, 
+                backend=backend, use_noise=use_noise, shots=shots
+            )
+            records.append({
+                "repeat": rep,
+                "seed": seed,
+                "dimension": d,
+                "layers": L,
+                "accuracy": metrics["accuracy"],
+            })
+    
+    print(f"Completed repeat {rep+1}")
+    return records
+
+
+def run_study(dimensions, layers_list, n_samples, test_size, maxiter, use_noise, noise_rate, shots, base_seed, repeats, output_path: Path, n_jobs: int = 1):
+    """Run full study across dimensions/layers with multiple repeats (seeds), parallelized."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Prepare arguments for parallel execution
+    task_args = [
+        (rep, base_seed + rep, dimensions, layers_list, n_samples, test_size, maxiter, use_noise, noise_rate, shots)
+        for rep in range(repeats)
+    ]
+    
+    print(f"Running {repeats} repeats with {n_jobs} parallel workers...")
+    
+    # Run in parallel
+    all_records = []
+    if n_jobs == 1:
+        # Sequential execution
+        for args in task_args:
+            records = run_single_repeat(args)
+            all_records.extend(records)
+    else:
+        # Parallel execution
+        with Pool(n_jobs) as pool:
+            results = pool.map(run_single_repeat, task_args)
+            for records in results:
+                all_records.extend(records)
     
     # Save to Excel
-    df_raw = pd.DataFrame(records)
+    df_raw = pd.DataFrame(all_records)
     summary = df_raw.groupby(["dimension", "layers"]).agg(
         mean_accuracy=("accuracy", "mean"),
         std_accuracy=("accuracy", "std"),
@@ -193,14 +221,14 @@ def run_study(dimensions, layers_list, n_samples, test_size, maxiter, use_noise,
         df_raw.to_excel(writer, sheet_name="raw", index=False)
         summary.to_excel(writer, sheet_name="summary", index=False)
     
-    print(f"\n{'='*60}\nSaved results to {output_path}")
+    print(f"\nSaved results to {output_path}")
     print("Summary statistics:")
     print(summary.to_string())
 
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Batch runner for re-uploading circuit study (supercomputer-friendly)",
+        description="Batch runner for re-uploading circuit study (supercomputer-friendly with parallelization)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     p.add_argument("--dimensions", type=int, nargs="+", default=[2, 3, 4, 5, 6], 
@@ -223,13 +251,26 @@ def parse_args():
                    help="Base random seed (repeats use seed, seed+1, ...)")
     p.add_argument("--repeats", type=int, default=3,
                    help="Number of independent runs with different seeds")
+    p.add_argument("--n-jobs", type=int, default=1,
+                   help="Number of parallel workers (1=sequential, -1=all cores)")
     p.add_argument("--output", type=Path, default=Path("RESULTS/reupload_study_batch.xlsx"),
                    help="Output Excel file path")
     return p.parse_args()
 
 
 def main():
+    import os
     args = parse_args()
+    
+    # Handle n_jobs: -1 means all available cores
+    n_cores_available = os.cpu_count()
+    n_jobs = args.n_jobs
+    if n_jobs == -1:
+        n_jobs = n_cores_available
+    
+    print(f"Available cores: {n_cores_available}")
+    print(f"Using {n_jobs} parallel worker(s)")
+    
     run_study(
         dimensions=args.dimensions,
         layers_list=args.layers,
@@ -242,6 +283,7 @@ def main():
         base_seed=args.seed,
         repeats=args.repeats,
         output_path=args.output,
+        n_jobs=n_jobs,
     )
 
 
